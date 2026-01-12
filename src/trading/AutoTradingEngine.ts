@@ -1,10 +1,6 @@
-// ============================================================================
-// FILE: src/trading/AutoTradingEngine.ts
-// ============================================================================
-
-import { Nord, NordUser, OrderSide, OrderType, PlaceOrderParams } from '@n1xyz/nord-ts';
+import { Nord, NordUser, Side, FillMode } from '@n1xyz/nord-ts';
 import { Connection, Keypair } from '@solana/web3.js';
-import BN from 'bn.js';
+import bs58 from 'bs58';
 
 export interface AutoTradingConfig {
   app: string;
@@ -17,7 +13,7 @@ export interface AutoTradingConfig {
 export interface GridConfig {
   marketId: number;
   levels: number;
-  spacing: number; // Percentuale
+  spacing: number;
   orderSize: number;
   basePrice: number;
 }
@@ -33,9 +29,6 @@ export class AutoTradingEngine {
     this.config = config;
   }
 
-  /**
-   * Inizializza il motore di trading
-   */
   async initialize(connection: Connection): Promise<void> {
     try {
       // Inizializza Nord
@@ -45,18 +38,19 @@ export class AutoTradingEngine {
         webServerUrl: this.config.webServerUrl,
       });
 
-      console.log('✅ Nord inizializzato con successo');
+      console.log('✅ Nord inizializzato');
 
-      // Crea o recupera l'utente
-      this.user = await this.nord.createUser(this.config.wallet);
-      console.log('✅ NordUser creato:', this.user.publicKey.toString());
-
-      // Verifica i saldi
-      const balances = await this.user.getBalances();
-      console.log('💰 Saldi disponibili:', balances.map(b => ({
-        symbol: b.symbol,
-        amount: b.amount.toString(),
-      })));
+      // Crea NordUser dalla private key
+      const privateKeyString = bs58.encode(this.config.wallet.secretKey);
+      this.user = NordUser.fromPrivateKey(this.nord, privateKeyString);
+      
+      // Aggiorna account ID e fetch info
+      await this.user.updateAccountId();
+      await this.user.fetchInfo();
+      
+      console.log('✅ NordUser creato');
+      console.log('💰 Saldi:', this.user.balances);
+      console.log('📊 Posizioni:', this.user.positions);
 
     } catch (error) {
       console.error('❌ Errore durante l\'inizializzazione:', error);
@@ -64,25 +58,11 @@ export class AutoTradingEngine {
     }
   }
 
-  /**
-   * Configura una strategia grid trading
-   */
   setupGrid(config: GridConfig): void {
     this.activeGrids.set(config.marketId, config);
-    console.log(`📊 Grid configurato per market ${config.marketId}:`, config);
+    console.log(`📊 Grid configurato per market ${config.marketId}`);
   }
 
-  /**
-   * Rimuove una strategia grid
-   */
-  removeGrid(marketId: number): void {
-    this.activeGrids.delete(marketId);
-    console.log(`🗑️ Grid rimosso per market ${marketId}`);
-  }
-
-  /**
-   * Esegue la strategia grid per un mercato
-   */
   async executeGrid(marketId: number): Promise<void> {
     const gridConfig = this.activeGrids.get(marketId);
     if (!gridConfig || !this.user) {
@@ -91,242 +71,137 @@ export class AutoTradingEngine {
     }
 
     try {
-      // Cancella gli ordini esistenti
-      await this.user.cancelAllOrders(marketId);
-
-      // Calcola i prezzi dei livelli
       const levels = this.calculateGridLevels(
         gridConfig.basePrice,
         gridConfig.spacing,
         gridConfig.levels
       );
 
-      // Piazza ordini buy sotto il prezzo base
+      // Piazza ordini buy
       const buyLevels = levels.filter(price => price < gridConfig.basePrice);
       for (const price of buyLevels) {
-        await this.placeOrder(
-          marketId,
-          'buy',
-          'limit',
-          gridConfig.orderSize,
-          price
-        );
-        await this.sleep(100); // Piccolo delay tra ordini
-      }
-
-      // Piazza ordini sell sopra il prezzo base
-      const sellLevels = levels.filter(price => price > gridConfig.basePrice);
-      for (const price of sellLevels) {
-        await this.placeOrder(
-          marketId,
-          'sell',
-          'limit',
-          gridConfig.orderSize,
-          price
-        );
+        await this.placeLimitOrder(marketId, Side.Bid, gridConfig.orderSize, price);
         await this.sleep(100);
       }
 
-      console.log(`✅ Grid eseguito per market ${marketId}: ${levels.length} ordini piazzati`);
+      // Piazza ordini sell
+      const sellLevels = levels.filter(price => price > gridConfig.basePrice);
+      for (const price of sellLevels) {
+        await this.placeLimitOrder(marketId, Side.Ask, gridConfig.orderSize, price);
+        await this.sleep(100);
+      }
+
+      console.log(`✅ Grid eseguito: ${levels.length} ordini`);
 
     } catch (error) {
-      console.error(`❌ Errore nell'esecuzione del grid per market ${marketId}:`, error);
+      console.error(`❌ Errore esecuzione grid:`, error);
     }
   }
 
-  /**
-   * Calcola i livelli di prezzo per la grid
-   */
-  private calculateGridLevels(
-    basePrice: number,
-    spacingPercent: number,
-    levels: number
-  ): number[] {
+  private calculateGridLevels(basePrice: number, spacingPercent: number, levels: number): number[] {
     const prices: number[] = [];
     const halfLevels = Math.floor(levels / 2);
 
-    // Livelli sotto il prezzo base
     for (let i = halfLevels; i > 0; i--) {
-      const price = basePrice * (1 - (spacingPercent / 100) * i);
-      prices.push(price);
+      prices.push(basePrice * (1 - (spacingPercent / 100) * i));
     }
 
-    // Livelli sopra il prezzo base
     for (let i = 1; i <= halfLevels; i++) {
-      const price = basePrice * (1 + (spacingPercent / 100) * i);
-      prices.push(price);
+      prices.push(basePrice * (1 + (spacingPercent / 100) * i));
     }
 
     return prices;
   }
 
-  /**
-   * Piazza un ordine
-   */
-  async placeOrder(
+  async placeLimitOrder(
     marketId: number,
-    side: OrderSide,
-    orderType: OrderType,
+    side: Side,
     size: number,
-    price?: number
-  ): Promise<string | null> {
+    price: number
+  ): Promise<bigint | null> {
     if (!this.user) {
       console.error('❌ User non inizializzato');
       return null;
     }
 
     try {
-      const params: PlaceOrderParams = {
+      const result = await this.user.placeOrder({
         marketId,
         side,
-        orderType,
+        fillMode: FillMode.Limit,
+        isReduceOnly: false,
         size,
         price,
-      };
+      });
 
-      const orderId = await this.user.placeOrder(params);
-      console.log(`✅ Ordine piazzato: ${orderId} (${side} ${size} @ ${price || 'market'})`);
-      return orderId;
+      console.log(`✅ Ordine limite: ${result.orderId} (${side} ${size} @ ${price})`);
+      return result.orderId || result.actionId;
 
     } catch (error) {
-      console.error('❌ Errore nel piazzare l\'ordine:', error);
+      console.error('❌ Errore piazzamento ordine:', error);
       return null;
     }
   }
 
-  /**
-   * Piazza un ordine limite
-   */
-  async placeLimitOrder(
-    marketId: number,
-    side: OrderSide,
-    size: number,
-    price: number
-  ): Promise<string | null> {
-    return this.placeOrder(marketId, side, 'limit', size, price);
-  }
-
-  /**
-   * Piazza un ordine a mercato
-   */
   async placeMarketOrder(
     marketId: number,
-    side: OrderSide,
+    side: Side,
     size: number
-  ): Promise<string | null> {
-    return this.placeOrder(marketId, side, 'market', size);
+  ): Promise<bigint | null> {
+    if (!this.user) {
+      console.error('❌ User non inizializzato');
+      return null;
+    }
+
+    try {
+      const result = await this.user.placeOrder({
+        marketId,
+        side,
+        fillMode: FillMode.Market,
+        isReduceOnly: false,
+        size,
+      });
+
+      console.log(`✅ Ordine market: ${result.actionId}`);
+      return result.actionId;
+
+    } catch (error) {
+      console.error('❌ Errore piazzamento ordine:', error);
+      return null;
+    }
   }
 
-  /**
-   * Cancella un ordine
-   */
-  async cancelOrder(marketId: number, orderId: string): Promise<boolean> {
+  async cancelOrder(orderId: bigint | string): Promise<boolean> {
     if (!this.user) {
       console.error('❌ User non inizializzato');
       return false;
     }
 
     try {
-      await this.user.cancelOrder(marketId, orderId);
+      await this.user.cancelOrder(orderId);
       console.log(`✅ Ordine cancellato: ${orderId}`);
       return true;
 
     } catch (error) {
-      console.error('❌ Errore nella cancellazione:', error);
+      console.error('❌ Errore cancellazione:', error);
       return false;
     }
   }
 
-  /**
-   * Cancella tutti gli ordini aperti
-   */
-  async cancelAllOrders(marketId?: number): Promise<boolean> {
-    if (!this.user) {
-      console.error('❌ User non inizializzato');
-      return false;
-    }
+  async refreshData(): Promise<void> {
+    if (!this.user) return;
 
     try {
-      await this.user.cancelAllOrders(marketId);
-      console.log('✅ Tutti gli ordini cancellati');
-      return true;
-
+      await this.user.fetchInfo();
+      console.log('🔄 Dati aggiornati');
     } catch (error) {
-      console.error('❌ Errore nella cancellazione di tutti gli ordini:', error);
-      return false;
+      console.error('❌ Errore aggiornamento dati:', error);
     }
   }
 
-  /**
-   * Ottiene gli ordini aperti
-   */
-  async getOpenOrders(marketId?: number) {
-    if (!this.user) return [];
-    
-    try {
-      return await this.user.getOpenOrders(marketId);
-    } catch (error) {
-      console.error('❌ Errore nel recuperare gli ordini aperti:', error);
-      return [];
-    }
-  }
-
-  /**
-   * Ottiene le posizioni correnti
-   */
-  async getPositions() {
-    if (!this.user) return [];
-    
-    try {
-      return await this.user.getPositions();
-    } catch (error) {
-      console.error('❌ Errore nel recuperare le posizioni:', error);
-      return [];
-    }
-  }
-
-  /**
-   * Ottiene il valore totale dell'account
-   */
-  async getAccountValue(): Promise<number> {
-    if (!this.user) return 0;
-    
-    try {
-      const value = await this.user.getAccountValue();
-      return value.toNumber();
-    } catch (error) {
-      console.error('❌ Errore nel recuperare il valore dell\'account:', error);
-      return 0;
-    }
-  }
-
-  /**
-   * Monitora e ribilancia le grid attive
-   */
-  private async monitorGrids(): Promise<void> {
-    for (const [marketId, gridConfig] of this.activeGrids) {
-      try {
-        const openOrders = await this.getOpenOrders(marketId);
-        
-        // Se ci sono meno ordini del previsto, riesegui la grid
-        const expectedOrders = gridConfig.levels;
-        if (openOrders.length < expectedOrders * 0.5) {
-          console.log(`🔄 Ribilanciamento grid per market ${marketId}`);
-          await this.executeGrid(marketId);
-        }
-
-      } catch (error) {
-        console.error(`❌ Errore nel monitoraggio grid per market ${marketId}:`, error);
-      }
-    }
-  }
-
-  /**
-   * Avvia il motore di trading
-   */
   async start(): Promise<void> {
     if (this.isRunning) {
-      console.log('⚠️ Il motore è già in esecuzione');
+      console.log('⚠️ Motore già in esecuzione');
       return;
     }
 
@@ -337,95 +212,43 @@ export class AutoTradingEngine {
     this.isRunning = true;
     console.log('🚀 AutoTradingEngine avviato');
 
-    // Loop principale
     this.mainLoop().catch((error) => {
-      console.error('❌ Errore nel loop principale:', error);
+      console.error('❌ Errore nel loop:', error);
       this.isRunning = false;
     });
   }
 
-  /**
-   * Loop principale del motore
-   */
   private async mainLoop(): Promise<void> {
     while (this.isRunning) {
       try {
-        // Monitora e ribilancia le grid
-        await this.monitorGrids();
+        await this.refreshData();
 
-        // Mostra statistiche
-        const stats = await this.getStats();
-        console.log('📊 Stats:', stats);
+        for (const [marketId] of this.activeGrids) {
+          console.log(`📊 Monitoraggio market ${marketId}`);
+        }
 
-        // Aspetta prima del prossimo ciclo
-        await this.sleep(10000); // 10 secondi
+        await this.sleep(10000);
 
       } catch (error) {
-        console.error('❌ Errore nel loop principale:', error);
+        console.error('❌ Errore nel loop:', error);
         await this.sleep(5000);
       }
     }
   }
 
-  /**
-   * Ottiene le statistiche correnti
-   */
-  async getStats() {
-    if (!this.user) {
-      return {
-        accountValue: 0,
-        openOrders: 0,
-        activePositions: 0,
-        activeGrids: 0,
-      };
-    }
-
-    const [accountValue, positions, allOrders] = await Promise.all([
-      this.getAccountValue(),
-      this.getPositions(),
-      this.getOpenOrders(),
-    ]);
-
-    return {
-      accountValue,
-      openOrders: allOrders.length,
-      activePositions: positions.length,
-      activeGrids: this.activeGrids.size,
-    };
-  }
-
-  /**
-   * Ferma il motore di trading
-   */
   async stop(): Promise<void> {
     this.isRunning = false;
-    
-    // Opzionalmente cancella tutti gli ordini aperti
-    if (this.user) {
-      console.log('🧹 Cancellazione ordini aperti...');
-      await this.cancelAllOrders();
-    }
-
     console.log('🛑 AutoTradingEngine fermato');
   }
 
-  /**
-   * Verifica se il motore è in esecuzione
-   */
   isEngineRunning(): boolean {
     return this.isRunning;
   }
 
-  /**
-   * Ottiene l'istanza NordUser
-   */
   getUser(): NordUser | null {
     return this.user;
   }
 
-  /**
-   * Helper per dormire
-   */
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }

@@ -1,170 +1,96 @@
-import { NordUser, Order, OrderSide, OrderType, PlaceOrderParams } from '@n1xyz/nord-ts';
-import BN from 'bn.js';
-
-export interface OrderOptions {
-  reduceOnly?: boolean;
-  clientId?: string;
-  postOnly?: boolean;
-  ioc?: boolean;
-  fok?: boolean;
-}
+import { NordUser, Side, FillMode } from '@n1xyz/nord-ts';
 
 export class OrderManager {
   constructor(private user: NordUser) {}
 
-  /**
-   * Piazza un ordine con opzioni avanzate
-   */
-  async placeOrder(
+  async placeLimitOrder(
     marketId: number,
-    side: OrderSide,
-    orderType: OrderType,
-    size: number | BN,
-    price?: number | BN,
-    options?: OrderOptions
-  ): Promise<string | null> {
+    side: Side,
+    size: number,
+    price: number,
+    isReduceOnly: boolean = false
+  ): Promise<bigint | null> {
     try {
-      const params: PlaceOrderParams = {
+      const result = await this.user.placeOrder({
         marketId,
         side,
-        orderType,
+        fillMode: FillMode.Limit,
+        isReduceOnly,
         size,
         price,
-        ...options,
-      };
+      });
 
-      const orderId = await this.user.placeOrder(params);
-      console.log(`OrderManager: Ordine piazzato ${orderId}`);
-      return orderId;
+      console.log(`OrderManager: Ordine limite ${result.orderId}`);
+      return result.orderId || result.actionId;
 
     } catch (error) {
-      console.error('OrderManager: Errore nel piazzare l\'ordine', error);
+      console.error('OrderManager: Errore', error);
       return null;
     }
   }
 
-  /**
-   * Piazza un ordine limite
-   */
-  async placeLimitOrder(
-    marketId: number,
-    side: OrderSide,
-    size: number | BN,
-    price: number | BN,
-    options?: OrderOptions
-  ): Promise<string | null> {
-    return this.placeOrder(marketId, side, 'limit', size, price, options);
-  }
-
-  /**
-   * Piazza un ordine a mercato
-   */
   async placeMarketOrder(
     marketId: number,
-    side: OrderSide,
-    size: number | BN,
-    options?: OrderOptions
-  ): Promise<string | null> {
-    return this.placeOrder(marketId, side, 'market', size, undefined, options);
-  }
-
-  /**
-   * Piazza un ordine post-only (maker only)
-   */
-  async placePostOnlyOrder(
-    marketId: number,
-    side: OrderSide,
-    size: number | BN,
-    price: number | BN,
-    options?: OrderOptions
-  ): Promise<string | null> {
-    return this.placeOrder(marketId, side, 'postOnly', size, price, {
-      ...options,
-      postOnly: true,
-    });
-  }
-
-  /**
-   * Cancella un ordine specifico
-   */
-  async cancelOrder(marketId: number, orderId: string): Promise<boolean> {
+    side: Side,
+    size: number,
+    isReduceOnly: boolean = false
+  ): Promise<bigint | null> {
     try {
-      await this.user.cancelOrder(marketId, orderId);
+      const result = await this.user.placeOrder({
+        marketId,
+        side,
+        fillMode: FillMode.Market,
+        isReduceOnly,
+        size,
+      });
+
+      console.log(`OrderManager: Ordine market ${result.actionId}`);
+      return result.actionId;
+
+    } catch (error) {
+      console.error('OrderManager: Errore', error);
+      return null;
+    }
+  }
+
+  async cancelOrder(orderId: bigint | string): Promise<boolean> {
+    try {
+      await this.user.cancelOrder(orderId);
       console.log(`OrderManager: Ordine ${orderId} cancellato`);
       return true;
 
     } catch (error) {
-      console.error('OrderManager: Errore nella cancellazione', error);
+      console.error('OrderManager: Errore cancellazione', error);
       return false;
     }
   }
 
-  /**
-   * Ottiene gli ordini aperti
-   */
-  async getOpenOrders(marketId?: number): Promise<Order[]> {
+  async cancelAllOrders(): Promise<number> {
     try {
-      return await this.user.getOpenOrders(marketId);
-    } catch (error) {
-      console.error('OrderManager: Errore nel recuperare gli ordini aperti', error);
-      return [];
-    }
-  }
-
-  /**
-   * Ottiene lo storico degli ordini
-   */
-  async getOrderHistory(marketId?: number): Promise<Order[]> {
-    try {
-      return await this.user.getOrderHistory(marketId);
-    } catch (error) {
-      console.error('OrderManager: Errore nel recuperare lo storico', error);
-      return [];
-    }
-  }
-
-  /**
-   * Cancella tutti gli ordini aperti
-   */
-  async cancelAllOrders(marketId?: number): Promise<number> {
-    try {
-      const openOrders = await this.getOpenOrders(marketId);
+      await this.user.fetchInfo();
+      const orders = Object.keys(this.user.orders);
       let cancelledCount = 0;
 
-      for (const order of openOrders) {
-        const success = await this.cancelOrder(order.marketId, order.id);
+      for (const orderId of orders) {
+        const success = await this.cancelOrder(BigInt(orderId));
         if (success) cancelledCount++;
       }
 
-      console.log(`OrderManager: ${cancelledCount}/${openOrders.length} ordini cancellati`);
+      console.log(`OrderManager: ${cancelledCount}/${orders.length} ordini cancellati`);
       return cancelledCount;
 
     } catch (error) {
-      console.error('OrderManager: Errore nella cancellazione di tutti gli ordini', error);
+      console.error('OrderManager: Errore cancellazione tutti gli ordini', error);
       return 0;
     }
   }
 
-  /**
-   * Modifica un ordine (cancella e ricrea)
-   */
-  async modifyOrder(
-    marketId: number,
-    orderId: string,
-    newSize: number | BN,
-    newPrice: number | BN,
-    side: OrderSide
-  ): Promise<string | null> {
+  async refreshOrders(): Promise<void> {
     try {
-      // Cancella l'ordine esistente
-      await this.cancelOrder(marketId, orderId);
-
-      // Piazza un nuovo ordine
-      return await this.placeLimitOrder(marketId, side, newSize, newPrice);
-
+      await this.user.fetchInfo();
+      console.log('OrderManager: Ordini aggiornati');
     } catch (error) {
-      console.error('OrderManager: Errore nella modifica dell\'ordine', error);
-      return null;
+      console.error('OrderManager: Errore aggiornamento', error);
     }
   }
 }

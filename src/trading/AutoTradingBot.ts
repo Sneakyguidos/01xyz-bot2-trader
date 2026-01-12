@@ -3,6 +3,7 @@ import { AutoTradingEngine } from './AutoTradingEngine.js';
 import { OrderManager } from './OrderManager.js';
 import { RiskManager, RiskLimits } from './RiskManager.js';
 import { Connection, Keypair } from '@solana/web3.js';
+import bs58 from 'bs58';
 
 export interface BotConfig {
   app: string;
@@ -25,18 +26,23 @@ export class AutoTradingBot {
   async initialize(connection: Connection): Promise<void> {
     console.log('🔄 Inizializzazione bot...');
 
-    // Inizializza Nord
     this.nord = await Nord.new({
       app: this.config.app,
       solanaConnection: connection,
       webServerUrl: this.config.webServerUrl,
     });
 
-    // Crea l'utente
-    this.user = await this.nord.createUser(this.config.wallet);
-    console.log('✅ User creato:', this.user.publicKey.toString());
+    console.log('✅ Nord inizializzato');
 
-    // Inizializza i componenti
+    // Crea NordUser dalla private key
+    const privateKeyString = bs58.encode(this.config.wallet.secretKey);
+    this.user = NordUser.fromPrivateKey(this.nord, privateKeyString);
+    
+    await this.user.updateAccountId();
+    await this.user.fetchInfo();
+    
+    console.log('✅ NordUser creato');
+
     this.orderManager = new OrderManager(this.user);
     this.riskManager = new RiskManager(this.user, this.config.riskLimits);
     await this.riskManager.initialize();
@@ -58,55 +64,43 @@ export class AutoTradingBot {
     }
 
     if (!this.engine || !this.orderManager || !this.riskManager) {
-      throw new Error('Bot non inizializzato. Chiama initialize() prima di start()');
+      throw new Error('Bot non inizializzato');
     }
 
     this.isRunning = true;
     console.log('🚀 Bot avviato');
 
-    // Avvia il loop di trading
     this.tradingLoop().catch((error) => {
-      console.error('❌ Errore nel loop di trading:', error);
+      console.error('❌ Errore nel loop:', error);
       this.isRunning = false;
     });
   }
 
   async stop(): Promise<void> {
     this.isRunning = false;
-    
-    if (this.orderManager) {
-      // Cancella tutti gli ordini aperti
-      await this.orderManager.cancelAllOrders(this.config.marketId);
-    }
-
     console.log('🛑 Bot fermato');
   }
 
   private async tradingLoop(): Promise<void> {
     while (this.isRunning) {
       try {
-        // Verifica lo stato del rischio
         if (!this.riskManager) continue;
 
         const canTrade = await this.riskManager.canPlaceOrder(
           this.config.marketId,
-          1 // Dimensione test
+          1
         );
 
         if (!canTrade) {
-          console.warn('⚠️ Condizioni di rischio non soddisfatte, skip trading');
-          await this.sleep(10000); // Aspetta 10 secondi
+          console.warn('⚠️ Condizioni di rischio non soddisfatte');
+          await this.sleep(10000);
           continue;
         }
 
-        // Qui implementa la tua logica di trading
-        // Ad esempio: analizza il mercato, piazza ordini, ecc.
-        
         const stats = await this.riskManager.getStats();
         console.log('📊 Stats:', stats);
 
-        // Aspetta prima del prossimo ciclo
-        await this.sleep(5000); // 5 secondi
+        await this.sleep(5000);
 
       } catch (error) {
         console.error('❌ Errore nel loop:', error);
@@ -122,6 +116,7 @@ export class AutoTradingBot {
   getStatus() {
     return {
       isRunning: this.isRunning,
+      hasNord: !!this.nord,
       hasUser: !!this.user,
       hasEngine: !!this.engine,
       marketId: this.config.marketId,

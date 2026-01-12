@@ -1,5 +1,5 @@
 import inquirer from 'inquirer';
-import { Nord, Market } from '@n1xyz/nord-ts';
+import { Nord } from '@n1xyz/nord-ts';
 import { Connection } from '@solana/web3.js';
 
 export interface TradingConfig {
@@ -18,18 +18,17 @@ export async function setupTradingConfig(
 ): Promise<TradingConfig> {
   console.log('\n🔧 Configurazione Trading Bot\n');
 
-  // Inizializza Nord per ottenere i mercati
   const nord = await Nord.new({
     app: nordConfig.app,
     solanaConnection: connection,
     webServerUrl: nordConfig.webServerUrl,
   });
 
-  const markets = await nord.getMarkets();
-  const choices = markets.map((m: Market) => ({
-    name: `${m.symbol} (ID: ${m.id})`,
-    value: m.id,
-  }));
+  const choices = [
+    { name: 'BTC-PERP (ID: 0)', value: 0 },
+    { name: 'ETH-PERP (ID: 1)', value: 1 },
+    { name: 'SOL-PERP (ID: 2)', value: 2 },
+  ];
 
   const answers = await inquirer.prompt([
     {
@@ -56,14 +55,14 @@ export async function setupTradingConfig(
       type: 'number',
       name: 'orderSize',
       message: 'Dimensione ordine (unità):',
-      default: 1,
+      default: 0.01,
       validate: (input: number) => input > 0,
     },
     {
       type: 'number',
       name: 'maxPositionSize',
       message: 'Dimensione massima posizione:',
-      default: 10,
+      default: 1,
       validate: (input: number) => input > 0,
     },
     {
@@ -75,11 +74,11 @@ export async function setupTradingConfig(
     },
   ]);
 
-  const selectedMarket = markets.find((m: Market) => m.id === answers.marketId);
+  const selectedChoice = choices.find(c => c.value === answers.marketId);
   
   return {
     marketId: answers.marketId,
-    marketSymbol: selectedMarket?.symbol || 'UNKNOWN',
+    marketSymbol: selectedChoice?.name.split(' ')[0] || 'UNKNOWN',
     gridLevels: answers.gridLevels,
     gridSpacing: answers.gridSpacing,
     orderSize: answers.orderSize,
